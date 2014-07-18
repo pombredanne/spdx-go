@@ -1,44 +1,82 @@
 package spdx
 
-type AnyLicenceInfo interface {
+import "strings"
+
+type AnyLicence interface {
+	Value
 	LicenceId() string
 }
 
-type LicenceReference struct {
-	Id      string
-	Licence *Licence
+type Licence struct{ ValueStr }
+
+func (l Licence) LicenceId() string    { return l.V() }
+func (l Licence) Equal(b Licence) bool { return l.ValueStr.Equal(b.ValueStr) }
+
+// Returns whether the licence is a reference or a is supposed to be in the SPDX Licence List.
+// Does not check if the licence actually is in the licence list (use InList() for that).
+func (l Licence) IsReference() bool {
+	return isLicIdRef(l.V())
 }
 
-func (l LicenceReference) LicenceId() string { return l.Id }
-
-func NewLicenceReference(id string) LicenceReference {
-	return LicenceReference{Id: id}
+// Checks whether the licence is in the SPDX Licence List.
+// It always looks up the SPDX Licence List index.
+func (l Licence) InList() bool {
+	return CheckLicence(l.V())
 }
 
-type Licence struct {
-	Id               string
-	Name             string // optional
-	Text             string
-	isOsiApproved    bool
-	StandardHeader   []string // optional
-	StandardTemplate string   // optional
-	CrossReference   []string // optional
-	Comment          string   // optional
+// Creates a new Licence.
+func NewLicence(id string, m *Meta) Licence {
+	return Licence{Str(id, m)}
 }
 
-func (l *Licence) LicenceId() string { return l.Id }
-
-type ExtractedLicensingInfo struct {
-	Id             string
-	Name           []string // conditional. one required if the licence is not in the SPDX Licence List
-	Text           string
-	CrossReference []string //optional
-	Comment        string   //optional
+type ExtractedLicence struct {
+	Id             ValueStr
+	Name           []ValueStr // conditional. one required if the licence is not in the SPDX Licence List
+	Text           ValueStr
+	CrossReference []ValueStr //optional
+	Comment        ValueStr   //optional
+	*Meta
 }
 
-func (l *ExtractedLicensingInfo) LicenceId() string { return l.Id }
+func (l *ExtractedLicence) LicenceId() string { return l.Id.V() }
+func (l *ExtractedLicence) V() string         { return l.LicenceId() }
+func (l *ExtractedLicence) M() *Meta          { return l.Meta }
 
-func join(list []AnyLicenceInfo, separator string) string {
+// Abstract licence set representation
+type LicenceSet struct {
+	Members []AnyLicence
+	*Meta
+}
+
+func (s *LicenceSet) Add(lic AnyLicence) { s.Members = append(s.Members, lic) }
+
+// DisjunctiveLicenceSet
+type ConjunctiveLicenceSet LicenceSet
+
+func NewConjunctiveSet(meta *Meta, lics ...AnyLicence) ConjunctiveLicenceSet {
+	return ConjunctiveLicenceSet{lics, meta}
+}
+func (c ConjunctiveLicenceSet) LicenceId() string   { return join(c.Members, " and ") }
+func (c ConjunctiveLicenceSet) V() string           { return c.LicenceId() }
+func (c ConjunctiveLicenceSet) M() *Meta            { return c.Meta }
+func (c *ConjunctiveLicenceSet) Add(lic AnyLicence) { c.Members = append(c.Members, lic) }
+
+// DisjunctiveLicenceSet
+type DisjunctiveLicenceSet LicenceSet
+
+func NewDisjunctiveSet(meta *Meta, lics ...AnyLicence) DisjunctiveLicenceSet {
+	return DisjunctiveLicenceSet{lics, meta}
+}
+func (c DisjunctiveLicenceSet) LicenceId() string   { return join(c.Members, " or ") }
+func (c DisjunctiveLicenceSet) V() string           { return c.LicenceId() }
+func (c DisjunctiveLicenceSet) M() *Meta            { return c.Meta }
+func (c *DisjunctiveLicenceSet) Add(lic AnyLicence) { c.Members = append(c.Members, lic) }
+
+// Useful functions for working with licences
+
+// Join the IDs for given licences by separator. Similar
+// to strings.Join but for []AnyLicence.
+func join(list []AnyLicence, separator string) string {
 	if len(list) == 0 {
 		return "()"
 	}
@@ -50,19 +88,9 @@ func join(list []AnyLicenceInfo, separator string) string {
 	return res
 }
 
-// DisjunctiveLicenceList is a AnyLicenceInfo
-type ConjunctiveLicenceList []AnyLicenceInfo
-
-func (c ConjunctiveLicenceList) LicenceId() string { return join(c, " and ") }
-
-// DisjunctiveLicenceList is a AnyLicenceInfo
-type DisjunctiveLicenceList []AnyLicenceInfo
-
-func (d DisjunctiveLicenceList) LicenceId() string { return join(d, " or ") }
-
-// Used to specify values such as NONE and NOASSERTION
-type LicenceStatus struct {
-	Status string
+// Returns whether the given ID is a Licence Reference ID (starts with LicenseRef-).
+// Does not check if the string after "LicenseRef-" satisfies the requirements of any SPDX version.
+// It is case-insensitive.
+func isLicIdRef(id string) bool {
+	return strings.HasPrefix(strings.ToLower(id), "licenseref-")
 }
-
-func (l LicenceStatus) LicenceId() string { return l.Status }

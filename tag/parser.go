@@ -1,176 +1,702 @@
 package tag
 
+import "github.com/vladvelici/spdx-go/spdx"
+
 import (
-	"bufio"
-	"bytes"
-	"errors"
-	"io"
+	"regexp"
 	"strings"
-	"unicode"
-	"unicode/utf8"
 )
 
-const (
-	OPEN_TAG  = "<text>"
-	CLOSE_TAG = "</text>"
-)
-
+// Regular expressions to match licence set separators
 var (
-	ErrNoCloseTag    = errors.New("Text tag opened but not closed. Missing a </text>?")
-	ErrInvalidText   = errors.New("Some invalid formatted string found.")
-	ErrInvalidPrefix = errors.New("No text is allowed between : and <text>.")
-	ErrInvalidSuffix = errors.New("No text is allowed after close text tag (</text>).")
-	ErrKeyNoValue    = errors.New("Key with no value returned by tokenizer")
+	orSeparator = regexp.MustCompile("(?i)\\s+or\\s+")  // disjunctive licence set separator
+	andSeprator = regexp.MustCompile("(?i)\\s+and\\s+") // conjunctive licence set separator
 )
 
-// Returns the number of bytes that are (part of) unicode whitespace characters at the beginning of the given []byte.
-func countSpaces(data []byte) int {
-	width, start := 0, 0
-	for ; start < len(data); start += width {
-		var r rune
-		r, width = utf8.DecodeRune(data[start:])
-		if !unicode.IsSpace(r) {
-			return start
+// A function that takes a *Token and updates some value in a SPDX element
+// (e.g. value SPDXVersion in spdx.Document).
+//
+// All the upd* functions (upd, updList, updCreator, etc.) return updaters for common SPDX values.
+type updater (func(*Token) error)
+
+// A map of SPDX Tags (properties) and updater functions
+type updaterMapping map[string]updater
+
+// Update the spdx.ValueStr pointer ptr.
+func upd(ptr *spdx.ValueStr) updater {
+	set := false
+	return func(tok *Token) error {
+		if set {
+			return spdx.NewParseError(MsgAlreadyDefined, tok.Meta)
 		}
-	}
-	return start
-}
-
-func tokenize() bufio.SplitFunc {
-	hasKey := false
-	return func(data []byte, atEOF bool) (advance int, token []byte, err error) {
-		shifted := 0
-
-		if !hasKey {
-			a := true
-			for a {
-				a = false
-
-				// clean whitespace
-				spaces := countSpaces(data)
-
-				// If all the data we have is white spaces, throw it away and read more.
-				if spaces == len(data) {
-					if atEOF {
-						return 0, nil, nil
-					}
-					return shifted + spaces, nil, nil
-				}
-
-				// If there is other data as well, throw the spaces away and continue
-				if spaces > 0 {
-					shifted += spaces
-					data = data[spaces:]
-					a = true
-				}
-
-				// First character is # then the line is a comment
-				if data[0] == '#' {
-					endl := bytes.IndexByte(data, '\n')
-
-					if endl < 0 {
-						return shifted, nil, nil
-					}
-
-					// If the endline is the last character, throw everything away and read more
-					if endl == len(data)-1 {
-						if atEOF {
-							return 0, nil, nil
-						}
-						return shifted + endl + 1, nil, nil
-					}
-
-					// Otherwise, if there is an endline and more data, throw the comment away and continue
-					if endl >= 0 {
-						a = true
-						shifted += endl + 1
-						data = data[endl+1:]
-					}
-				}
-			}
-		}
-
-		if !hasKey {
-			column := bytes.IndexByte(data, ':')
-			if column < 0 {
-				if atEOF {
-					return 0, nil, ErrInvalidText
-				}
-				return shifted, nil, nil
-			}
-			hasKey = true
-			return shifted + column + 1, data[:column], nil
-		}
-
-		startText := bytes.Index(data, []byte(OPEN_TAG))
-		endl := bytes.IndexByte(data, '\n')
-
-		if startText >= 0 && (endl < 0 || startText < endl) {
-
-			if countSpaces(data[:startText]) != startText {
-				return 0, nil, ErrInvalidPrefix
-			}
-
-			endText := bytes.Index(data, []byte(CLOSE_TAG))
-			if endText < 0 {
-				if atEOF {
-					return 0, nil, ErrNoCloseTag
-				}
-				return shifted, nil, nil
-			}
-
-			valStart, valEnd := startText+len(OPEN_TAG), endText
-
-			endlAfterEndTxt := bytes.IndexByte(data[endText:], '\n')
-
-			var closeToEndl []byte
-
-			if endlAfterEndTxt < 0 {
-				if !atEOF {
-					return 0, nil, nil
-				}
-				closeToEndl = data[endText+len(CLOSE_TAG):]
-			} else if endlAfterEndTxt+endText < len(data) {
-				closeToEndl = data[endText+len(CLOSE_TAG) : endlAfterEndTxt+endText]
-			}
-
-			if closeToEndl != nil && countSpaces(closeToEndl) != len(closeToEndl) {
-				return 0, nil, ErrInvalidSuffix
-			}
-
-			hasKey = false
-			return shifted + endText + len(CLOSE_TAG), data[valStart:valEnd], nil
-		}
-
-		if endl < 0 {
-			if atEOF {
-				hasKey = false
-				return shifted + len(data), data[:], nil
-			}
-			return shifted, nil, nil
-		}
-		hasKey = false
-		return shifted + endl + 1, data[:endl], nil
+		ptr.Val = tok.Pair.Value
+		ptr.Meta = tok.Meta
+		set = true
+		return nil
 	}
 }
 
-type Pair struct {
-	Key, Value string
+// Update the spdx.ValueStr pointer returned by the delay function, which is called only
+// the first time this element is assigned to a value.
+func updDelay(delay func(*Token) *spdx.ValueStr) updater {
+	var f updater
+	return func(tok *Token) error {
+		if f == nil {
+			f = upd(delay(tok))
+		}
+		return f(tok)
+	}
 }
 
-func Parse(f io.Reader) (doc []Pair, err error) {
-	scanner := bufio.NewScanner(f)
-	scanner.Split(tokenize())
-	doc = make([]Pair, 0, 15)
-	for scanner.Scan() {
-		key := strings.TrimSpace(scanner.Text())
-		value := ""
-		if scanner.Scan() {
-			value = strings.TrimSpace(scanner.Text())
+// Update the []spdx.ValueStr pointer arr.
+func updList(arr *[]spdx.ValueStr) updater {
+	return func(tok *Token) error {
+		*arr = append(*arr, spdx.Str(tok.Pair.Value, tok.Meta))
+		return nil
+	}
+}
+
+// Update the []spdx.ValueStr pointer returned by the delay function, which is called only
+// the first time this element is assigned to a value.
+func updListDelay(delay func(*Token) *[]spdx.ValueStr) updater {
+	var f updater
+	return func(tok *Token) error {
+		if f == nil {
+			f = updList(delay(tok))
 		}
-		doc = append(doc, Pair{key, value})
+		return f(tok)
+	}
+}
+
+// Update the spdx.ValueCreator pointer ptr.
+func updCreator(ptr *spdx.ValueCreator) updater {
+	set := false
+	return func(tok *Token) error {
+		if set {
+			return spdx.NewParseError(MsgAlreadyDefined, tok.Meta)
+		}
+		ptr.SetValue(tok.Pair.Value)
+		ptr.Meta = tok.Meta
+		set = true
+		return nil
+	}
+}
+
+// Update the spdx.ValueCreator pointer returned by the delay function, which is called only
+// the first time this element is assigned to a value.
+func updCreatorDelay(delay func(*Token) *spdx.ValueCreator) updater {
+	var f updater
+	return func(tok *Token) error {
+		if f == nil {
+			f = updCreator(delay(tok))
+		}
+		return f(tok)
+	}
+}
+
+// Update the []ValueCreator pointer ptr.
+func updCreatorList(arr *[]spdx.ValueCreator) updater {
+	return func(tok *Token) error {
+		*arr = append(*arr, spdx.NewValueCreator(tok.Pair.Value, tok.Meta))
+		return nil
+	}
+}
+
+// Update the []spdx.ValueCreator pointer returned by the delay function, which is called only
+// the first time this element is assigned to a value.
+func updCreatorListDelay(delay func(*Token) *[]spdx.ValueCreator) updater {
+	var f updater
+	return func(tok *Token) error {
+		if f == nil {
+			f = updCreatorList(delay(tok))
+		}
+		return f(tok)
+	}
+}
+
+// Update the spdx.ValueDate pointer ptr.
+func updDate(ptr *spdx.ValueDate) updater {
+	set := false
+	return func(tok *Token) error {
+		if set {
+			return spdx.NewParseError(MsgAlreadyDefined, tok.Meta)
+		}
+		ptr.SetValue(tok.Pair.Value)
+		ptr.Meta = tok.Meta
+		set = true
+		return nil
+	}
+}
+
+// Update the spdx.ValueDate pointer returned by the delay function, which is called only
+// the first time this element is assigned to a value.
+func updDateDelay(delay func(tok *Token) *spdx.ValueDate) updater {
+	var f updater
+	return func(tok *Token) error {
+		if f == nil {
+			f = updDate(delay(tok))
+		}
+		return f(tok)
+	}
+}
+
+// Update the spdx.VerificationCode pointer ptr.
+func updVerifCode(vc *spdx.VerificationCode) updater {
+	set := false
+	return func(tok *Token) error {
+		if set {
+			return spdx.NewParseError(MsgAlreadyDefined, tok.Meta)
+		}
+		val := tok.Pair.Value
+		open := strings.Index(val, "(")
+		if open > 0 {
+			vc.Value = spdx.Str(strings.TrimSpace(val[:open]), tok.Meta)
+
+			val = val[open+1:]
+
+			// close parentheses
+			cls := strings.LastIndex(val, ")")
+			if cls < 0 {
+				return spdx.NewParseError(MsgNoClosedParen, tok.Meta)
+			}
+
+			val = val[:cls]
+
+			// remove "excludes:" if exists
+			excludeRegexp := regexp.MustCompile("(?i)excludes:\\s*")
+			val = excludeRegexp.ReplaceAllLiteralString(val, "")
+
+			exclFiles := strings.Split(val, ",")
+			vc.ExcludedFiles = make([]spdx.ValueStr, len(exclFiles))
+			for i, v := range exclFiles {
+				vc.ExcludedFiles[i] = spdx.Str(strings.TrimSpace(v), tok.Meta)
+			}
+		} else {
+			vc.Value = spdx.Str(strings.TrimSpace(val), tok.Meta)
+		}
+		set = true
+		return nil
+	}
+}
+
+// Update the spdx.VerificationCode pointer returned by the delay function, which
+// is called only the first time this element is assigned to a value.
+func updVerifCodeDelay(delay func(*Token) *spdx.VerificationCode) updater {
+	var f updater
+	return func(tok *Token) error {
+		if f == nil {
+			f = updVerifCode(delay(tok))
+		}
+		return f(tok)
+	}
+}
+
+// Update the spdx.Checksum pointer ptr.
+func updChecksum(cksum *spdx.Checksum) updater {
+	set := false
+	return func(tok *Token) error {
+		if set {
+			return spdx.NewParseError(MsgAlreadyDefined, tok.Meta)
+		}
+		split := strings.Split(tok.Pair.Value, ":")
+		if len(split) != 2 {
+			return spdx.NewParseError(MsgInvalidChecksum, tok.Meta)
+		}
+		cksum.Algo, cksum.Value = spdx.Str(strings.TrimSpace(split[0]), tok.Meta), spdx.Str(strings.TrimSpace(split[1]), tok.Meta)
+		set = true
+		return nil
+	}
+}
+
+// Update the spdx.Checksum pointer returned by the delay function, which
+// is called only the first time this element is assigned to a value.
+func updChecksumDelay(delay func(*Token) *spdx.Checksum) updater {
+	var f updater
+	return func(tok *Token) error {
+		if f == nil {
+			f = updChecksum(delay(tok))
+		}
+		return f(tok)
+	}
+}
+
+// Finds the bigger set of open-close parantheses.
+// If there is no open parentheses it returns -1 and -2.
+// If there is no closing parantheses for the first open parantheses found,
+// it returns open to be the index where the first open parantheses is found
+// and close to be -2.
+//
+// To check whether a good match has been found, check whether open < close rather than open >= 0
+//
+// Example:
+//  "a and (b or (c and d))"
+//  returns: open=7, cls=21 (input[open:cls+1]=="(b or (c and d))")
+func findMatchingParenSet(str string) (open, cls int) {
+	open, cls = -1, -2
+	open = strings.Index(str, "(")
+	if open < 0 {
+		return
+	}
+	count := 0
+	for i := open; i < len(str); i++ {
+		if str[i] == '(' {
+			count++
+		} else if str[i] == ')' {
+			count--
+		}
+		if count == 0 {
+			return open, i
+		}
+	}
+	return
+}
+
+// Determines if a licence set string is disjunctive, conjunctive, both or none.
+// Assumes balanced parantheses in the input.
+func conjOrDisjSet(str string) (conj, disj bool) {
+	str = strings.TrimSpace(str)
+
+	// clear parentheses
+	for open, cls := findMatchingParenSet(str); cls > open; open, cls = findMatchingParenSet(str) {
+		if cls == len(str)-1 {
+			str = str[:open]
+		} else {
+			str = str[:open] + str[cls+1:]
+		}
 	}
 
-	err = scanner.Err()
-	return doc, err
+	// test both and and or separators
+	conj = andSeprator.FindStringIndex(str) != nil
+	disj = orSeparator.FindStringIndex(str) != nil
+
+	return
+}
+
+// Splits a licence set string into tokens separated by the given separator.
+// Ignores the separator if it is contained in parentheses.
+func licenceSetSplit(sep *regexp.Regexp, str string) []string {
+	separators := sep.FindAllStringIndex(str, -1)
+	if separators == nil {
+		return []string{str}
+	}
+
+	used := 0
+	result := make([]string, 0)
+	for i := 0; i < len(separators); i++ {
+		nextOpen, nextClose := findMatchingParenSet(str[used:])
+		if nextOpen >= 0 && nextClose >= 0 {
+			nextOpen += used
+			nextClose += used
+		}
+
+		nextSep := separators[i]
+		if nextOpen < nextSep[0] && nextSep[1] < nextClose {
+			// find a new token that's after nextClose
+			continue
+		}
+
+		result = append(result, strings.TrimSpace(str[used:nextSep[0]]))
+		used = nextSep[1]
+	}
+
+	lastToken := strings.TrimSpace(str[used:])
+	if len(lastToken) > 0 {
+		result = append(result, lastToken)
+	}
+
+	return result
+}
+
+// Parses sets of licences. Assumes the input tok.Value to have balanced parentheses.
+func parseLicenceSet(tok *Token) (spdx.AnyLicence, error) {
+	val := strings.TrimSpace(tok.Pair.Value)
+	if len(val) == 0 {
+		return nil, spdx.NewParseError(MsgEmptyLicence, tok.Meta)
+	}
+
+	// if everything is in parentheses, remove the big parentheses
+	o, c := findMatchingParenSet(val)
+	if o == 0 && c == len(val)-1 {
+		if len(val) <= 2 {
+			return nil, spdx.NewParseError(MsgEmptyLicence, tok.Meta)
+		}
+		val = val[1 : len(val)-1]
+	}
+
+	conj, disj := conjOrDisjSet(val)
+
+	if disj && conj {
+		return nil, spdx.NewParseError(MsgConjunctionAndDisjunction, tok.Meta)
+	}
+
+	if conj {
+		tokens := licenceSetSplit(andSeprator, val)
+		res := spdx.NewConjunctiveSet(nil)
+		for _, t := range tokens {
+			lic, err := parseLicenceSet(&Token{Type: tok.Type, Meta: tok.Meta, Pair: Pair{Value: t}})
+			if err != nil {
+				return nil, err
+			}
+			if res.Meta == nil {
+				res.Meta = lic.M()
+			}
+			res.Members = append(res.Members, lic)
+		}
+		return res, nil
+	}
+
+	if disj {
+		tokens := licenceSetSplit(orSeparator, val)
+		res := spdx.NewDisjunctiveSet(nil)
+		for _, t := range tokens {
+			lic, err := parseLicenceSet(&Token{Type: tok.Type, Meta: tok.Meta, Pair: Pair{Value: t}})
+			if err != nil {
+				return nil, err
+			}
+			if res.Meta == nil {
+				res.Meta = lic.M()
+			}
+			res.Members = append(res.Members, lic)
+		}
+		return res, nil
+	}
+
+	return spdx.NewLicence(strings.TrimSpace(val), tok.Meta), nil
+
+}
+
+// Given a Token, returns the appropriate spdx.AnyLicence. If there are parentheses, it
+// checks whether they are balanced and calls parseLicenceSet()
+func parseLicenceString(tok *Token) (spdx.AnyLicence, error) {
+	val := strings.TrimSpace(tok.Pair.Value)
+	if len(val) == 0 {
+		return nil, spdx.NewParseError(MsgEmptyLicence, tok.Meta)
+	}
+	openParen := strings.Count(val, "(")
+	closeParen := strings.Count(val, ")")
+
+	if openParen != closeParen {
+		return nil, spdx.NewParseError(MsgNoClosedParen, tok.Meta)
+	}
+
+	if openParen > 0 {
+		return parseLicenceSet(tok)
+	}
+
+	return spdx.NewLicence(strings.TrimSpace(val), tok.Meta), nil
+}
+
+// Update a AnyLicence pointer.
+func anyLicence(lic *spdx.AnyLicence) updater {
+	set := false
+	return func(tok *Token) error {
+		if set {
+			return spdx.NewParseError(MsgAlreadyDefined, tok.Meta)
+		}
+		l, err := parseLicenceString(tok)
+		if err != nil {
+			return err
+		}
+		*lic = l
+		set = true
+		return nil
+	}
+}
+
+// Update a []AnyLicence pointer
+func anyLicenceList(licList *[]spdx.AnyLicence) updater {
+	return func(tok *Token) error {
+		l, err := parseLicenceString(tok)
+		if err != nil {
+			return err
+		}
+		*licList = append(*licList, l)
+		return nil
+	}
+}
+
+// Creates a file that only has the FileName and appends it to the given []*File pointer
+func updFileNameList(fl *[]*spdx.File) updater {
+	return func(tok *Token) error {
+		file := &spdx.File{Name: spdx.Str(tok.Value, tok.Meta)}
+		*fl = append(*fl, file)
+		return nil
+	}
+}
+
+// Gets all the key/value combinations in src and puts them in dest (overwrites if values already exist)
+func mapMerge(dest *updaterMapping, src updaterMapping) {
+	mp := *dest
+	for k, v := range src {
+		mp[k] = v
+	}
+}
+
+// Creates the mapping of a *spdx.Document in Tag format.
+func documentMap(doc *spdx.Document) *updaterMapping {
+
+	initCreationInfo := func(tok *Token) {
+		if doc.CreationInfo == nil {
+			doc.CreationInfo = new(spdx.CreationInfo)
+			doc.CreationInfo.Meta = tok.Meta
+		}
+	}
+
+	var mapping updaterMapping
+
+	mapping = map[string]updater{
+		// SpdxDocument
+		"SPDXVersion":     upd(&doc.SpecVersion),
+		"DataLicense":     upd(&doc.DataLicence),
+		"DocumentComment": upd(&doc.Comment),
+		"Creator": updCreatorListDelay(func(tok *Token) *[]spdx.ValueCreator {
+			initCreationInfo(tok)
+			if doc.CreationInfo.Creator == nil {
+				doc.CreationInfo.Creator = make([]spdx.ValueCreator, 0)
+			}
+			return &doc.CreationInfo.Creator
+		}),
+		"Created":            updDateDelay(func(tok *Token) *spdx.ValueDate { initCreationInfo(tok); return &doc.CreationInfo.Created }),
+		"CreatorComment":     updDelay(func(tok *Token) *spdx.ValueStr { initCreationInfo(tok); return &doc.CreationInfo.Comment }),
+		"LicenseListVersion": updDelay(func(tok *Token) *spdx.ValueStr { initCreationInfo(tok); return &doc.CreationInfo.LicenceListVersion }),
+
+		// Package
+		"PackageName": func(tok *Token) error {
+			pkg := &spdx.Package{
+				Name: spdx.Str(tok.Value, tok.Meta),
+				Meta: tok.Meta,
+			}
+
+			if doc.Packages == nil {
+				doc.Packages = []*spdx.Package{pkg}
+			} else {
+				doc.Packages = append(doc.Packages, pkg)
+			}
+
+			// Add package values that are now available
+			mapMerge(&mapping, updaterMapping{
+				"PackageVersion":          upd(&pkg.Version),
+				"PackageFileName":         upd(&pkg.FileName),
+				"PackageSupplier":         updCreator(&pkg.Supplier),
+				"PackageOriginator":       updCreator(&pkg.Originator),
+				"PackageDownloadLocation": upd(&pkg.DownloadLocation),
+				"PackageVerificationCode": updVerifCodeDelay(func(tok *Token) *spdx.VerificationCode {
+					if pkg.VerificationCode == nil {
+						pkg.VerificationCode = new(spdx.VerificationCode)
+						pkg.VerificationCode.Meta = tok.Meta
+					}
+					return pkg.VerificationCode
+				}),
+				"PackageChecksum": updChecksumDelay(func(tok *Token) *spdx.Checksum {
+					if pkg.Checksum == nil {
+						pkg.Checksum = new(spdx.Checksum)
+						pkg.Checksum.Meta = tok.Meta
+					}
+					return pkg.Checksum
+				}),
+				"PackageHomePage":             upd(&pkg.HomePage),
+				"PackageSourceInfo":           upd(&pkg.SourceInfo),
+				"PackageLicenseConcluded":     anyLicence(&pkg.LicenceConcluded),
+				"PackageLicenseInfoFromFiles": anyLicenceList(&pkg.LicenceInfoFromFiles),
+				"PackageLicenseDeclared":      anyLicence(&pkg.LicenceDeclared),
+				"PackageLicenseComments":      upd(&pkg.LicenceComments),
+				"PackageCopyrightText":        upd(&pkg.CopyrightText),
+				"PackageSummary":              upd(&pkg.Summary),
+				"PackageDescription":          upd(&pkg.Description),
+			})
+
+			return nil
+		},
+		// File
+		"FileName": func(tok *Token) error {
+			file := &spdx.File{
+				Name: spdx.Str(tok.Value, tok.Meta),
+				Meta: tok.Meta,
+			}
+
+			if doc.Files == nil {
+				doc.Files = []*spdx.File{file}
+			} else {
+				doc.Files = append(doc.Files, file)
+			}
+
+			mapMerge(&mapping, updaterMapping{
+				"FileType":          upd(&file.Type),
+				"LicenseConcluded":  anyLicence(&file.LicenceConcluded),
+				"LicenseInfoInFile": anyLicenceList(&file.LicenceInfoInFile),
+				"LicenseComments":   upd(&file.LicenceComments),
+				"FileCopyrightText": upd(&file.CopyrightText),
+				"FileComment":       upd(&file.Comment),
+				"FileNotice":        upd(&file.Notice),
+				"FileContributor":   updList(&file.Contributor),
+				"FileDependency":    updFileNameList(&file.Dependency),
+				"FileChecksum": updChecksumDelay(func(tok *Token) *spdx.Checksum {
+					if file.Checksum == nil {
+						file.Checksum = new(spdx.Checksum)
+						file.Checksum.Meta = tok.Meta
+					}
+					return file.Checksum
+				}),
+				"ArtifactOfProjectName": func(tok *Token) error {
+					artif := &spdx.ArtifactOf{Meta: tok.Meta}
+					artif.Name = spdx.Str(tok.Value, tok.Meta)
+					mapMerge(&mapping, updaterMapping{
+						"ArtifactOfProjectHomePage": upd(&artif.HomePage),
+						"ArtifactOfProjectURI":      upd(&artif.ProjectUri),
+					})
+					file.ArtifactOf = append(file.ArtifactOf, artif)
+					return nil
+				},
+			})
+
+			return nil
+		},
+
+		// ExtractedLicence
+		"LicenseID": func(tok *Token) error {
+			lic := &spdx.ExtractedLicence{
+				Id:   spdx.Str(tok.Value, tok.Meta),
+				Meta: tok.Meta,
+			}
+			mapMerge(&mapping, updaterMapping{
+				"ExtractedText":         upd(&lic.Text),
+				"LicenseName":           updList(&lic.Name),
+				"LicenseCrossReference": updList(&lic.CrossReference),
+				"LicenseComment":        upd(&lic.Comment),
+			})
+
+			if doc.ExtractedLicences == nil {
+				doc.ExtractedLicences = []*spdx.ExtractedLicence{lic}
+			} else {
+				doc.ExtractedLicences = append(doc.ExtractedLicences, lic)
+			}
+
+			return nil
+		},
+
+		"Reviewer": func(tok *Token) error {
+			rev := &spdx.Review{
+				Reviewer: spdx.NewValueCreator(tok.Value, tok.Meta),
+				Meta:     tok.Meta,
+			}
+
+			if doc.Reviews == nil {
+				doc.Reviews = []*spdx.Review{rev}
+			} else {
+				doc.Reviews = append(doc.Reviews, rev)
+			}
+
+			mapMerge(&mapping, updaterMapping{
+				"ReviewDate":    updDate(&rev.Date),
+				"ReviewComment": upd(&rev.Comment),
+			})
+
+			return nil
+		},
+	}
+
+	return &mapping
+}
+
+// Apply the relevant updater function if the given pair matches any.
+//
+// ok means whether the property was in the map or not
+// err is the error returned by applying the mapping function or, if ok == false, an error with the relevant "mapping not found" message
+//
+// It returns two arguments to allow for easily creating parsing modes such as "ignore not known mapping"
+func applyMapping(tok *Token, mapping *updaterMapping) (ok bool, err error) {
+	f, ok := (*mapping)[tok.Key]
+	if !ok {
+		return false, spdx.NewParseError("Invalid property or property needs another property to be defined before it: "+tok.Key, tok.Meta)
+	}
+	return true, f(tok)
+}
+
+func updateLicenceReferences(lic *spdx.AnyLicence, index map[string]*spdx.ExtractedLicence) {
+	switch t := (*lic).(type) {
+	case spdx.Licence:
+		if t.IsReference() {
+			if ref, ok := index[t.LicenceId()]; ok {
+				*lic = ref
+			}
+		}
+	case spdx.DisjunctiveLicenceSet:
+		for i := range t.Members {
+			updateLicenceReferences(&t.Members[i], index)
+		}
+	case spdx.ConjunctiveLicenceSet:
+		for i := range t.Members {
+			updateLicenceReferences(&t.Members[i], index)
+		}
+	}
+}
+
+// Parse Tokens given by a lexer to a *spdx.Document.
+// Errors returned are either I/O errors returned by the io.Reader associated with the given lexer,
+// lexing errors (still have *ParseError type) or parse errors (type *ParseError).
+func Parse(lex lexer) (*spdx.Document, error) {
+	doc := new(spdx.Document)
+	mapping := documentMap(doc)
+	for lex.Lex() {
+		token := lex.Token()
+
+		// ignore comments if they're returned by lexer
+		if token.Type != TokenPair {
+			continue
+		}
+
+		_, err := applyMapping(token, mapping)
+		if err != nil {
+			return nil, err
+		}
+
+		// first token with non-nil meta is the document meta
+		if doc.Meta == nil {
+			doc.Meta = token.Meta
+		}
+	}
+
+	if lex.Err() != nil {
+		return nil, lex.Err()
+	}
+
+	// licence references index
+	licenceMap := make(map[string]*spdx.ExtractedLicence)
+	for _, lic := range doc.ExtractedLicences {
+		licenceMap[lic.LicenceId()] = lic
+	}
+
+	// fix file dependency references
+	fileMap := make(map[string]*spdx.File)
+	for _, file := range doc.Files {
+		fileMap[file.Name.Val] = file
+		// fix file licences
+		if file.LicenceConcluded != nil {
+			updateLicenceReferences(&file.LicenceConcluded, licenceMap)
+		}
+		for i := range file.LicenceInfoInFile {
+			updateLicenceReferences(&file.LicenceInfoInFile[i], licenceMap)
+		}
+	}
+	for _, file := range doc.Files {
+		for i, dep := range file.Dependency {
+			if f := fileMap[dep.Name.Val]; f != nil {
+				file.Dependency[i] = f
+			}
+		}
+	}
+
+	for _, pkg := range doc.Packages {
+		if pkg.LicenceConcluded != nil {
+			updateLicenceReferences(&pkg.LicenceConcluded, licenceMap)
+		}
+		if pkg.LicenceDeclared != nil {
+			updateLicenceReferences(&pkg.LicenceDeclared, licenceMap)
+		}
+		for i := range pkg.LicenceInfoFromFiles {
+			updateLicenceReferences(&pkg.LicenceInfoFromFiles[i], licenceMap)
+		}
+	}
+
+	return doc, nil
 }

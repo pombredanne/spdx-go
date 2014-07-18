@@ -4,20 +4,25 @@ const DATA_LICENCE_TAG = "CC0-1.0"
 const DATA_LICENCE_RDF = "http://spdx.org/licenses/CC0-1.0"
 
 type Document struct {
-	SpecVersion          string                    // one
-	DataLicence          string                    // one
-	CreationInfo         *CreationInfo             //
-	ExtractedLicenceInfo []*ExtractedLicensingInfo // optional
-	Packages             []*Package                // spdx1.2: one, spdx2: one or more
-	Files                []*File                   // mandatory
-	Comment              string                    // optional
-	Reviewed             []*Review                 // optional
-	OtherLicences        map[string]*Licence       // licences that are not in the spec and are referenced to
+	SpecVersion       ValueStr            // one
+	DataLicence       ValueStr            // one
+	CreationInfo      *CreationInfo       //
+	ExtractedLicences []*ExtractedLicence // optional
+	Packages          []*Package          // spdx1.2: one, spdx2: one or more
+	Files             []*File             // mandatory
+	Comment           ValueStr            // optional
+	Reviews           []*Review           // optional
+	*Meta
 }
 
+func (doc *Document) M() *Meta { return doc.Meta }
+
 type CreationInfo struct {
-	Creator            []string // one or many
-	Created            string   // one
-	LicenceListVersion string   // zero or one
-	Comment            string   // zero or one
+	Creator            []ValueCreator // one or many
+	Created            ValueDate      // one
+	LicenceListVersion ValueStr       // zero or one
+	Comment            ValueStr       // zero or one
+	*Meta
 }
+
+func (ci *CreationInfo) M() *Meta { return ci.Meta }
